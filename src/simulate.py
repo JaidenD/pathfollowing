@@ -3,13 +3,13 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 
-from so3 import orthogonality_error, project_to_so3, exp_so3
+from so3 import orthogonality_error, project_to_so3
 from path import integrate_path
 from controller import Gains, RefProfile, closed_loop_step
 
 
-def run_case(kind: str, T: float = 12.0, dt: float = 0.0025, J_true=None):
-    path = integrate_path(L=12.0, N=8000)
+def run_case(kind: str, T: float = 6.0, dt: float = 0.03, J_true=None, seed: int = 0):
+    path = integrate_path(L=12.0, N=800)
     J_nom = np.diag([1.0, 1.2, 0.8])
     if J_true is None:
         J_true = J_nom.copy()
@@ -20,12 +20,11 @@ def run_case(kind: str, T: float = 12.0, dt: float = 0.0025, J_true=None):
     N = int(T / dt)
     t = np.linspace(0.0, T, N + 1)
 
+    R = np.eye(3)
+    # initialize near eta=0.1, xi=(0.1,-0.1)
     eta = 0.1
+    w = np.array([0.0, 0.0, 0.0])
     xi_prev = np.array([0.1, -0.1])
-    gamma0, _, _, _, N0, _, _ = path.eval(eta)
-    e0 = N0 @ xi_prev
-    R = gamma0 @ exp_so3(e0)
-    w = np.zeros(3)
 
     xi_hist = np.zeros((N + 1, 2))
     eta_hist = np.zeros(N + 1)
@@ -39,7 +38,7 @@ def run_case(kind: str, T: float = 12.0, dt: float = 0.0025, J_true=None):
             R, w, eta, xi, etadot, nu, tau = closed_loop_step(
                 t[k - 1], R, w, path, eta, gains, J_nom, J_true, ref, dt, xi_prev
             )
-            if k % 100 == 0:
+            if k % 200 == 0:
                 R = project_to_so3(R)
             xi_prev = xi
         else:
@@ -95,11 +94,12 @@ def monte_carlo(path_png: Path, trials: int = 30, seed: int = 7):
         P = rng.uniform(-0.2, 0.2, size=(3, 3))
         P = 0.5 * (P + P.T)
         J_true = J @ (np.eye(3) + P)
+        # enforce SPD
         eigvals, eigvecs = np.linalg.eigh(J_true)
         eigvals = np.clip(eigvals, 0.2, None)
         J_true = eigvecs @ np.diag(eigvals) @ eigvecs.T
 
-        _, _, _, _, metrics = run_case("eta", T=8.0, dt=0.0025, J_true=J_true)
+        _, xi_hist, vel_err, _, metrics = run_case("eta", T=5.0, dt=0.03, J_true=J_true)
         finals.append(metrics["final_xi_norm"])
         rmses.append(metrics["rms_vel_err"])
 
@@ -129,10 +129,10 @@ def main():
     out_fig.mkdir(parents=True, exist_ok=True)
     out_res.mkdir(parents=True, exist_ok=True)
 
-    t1, xi1, ve1, _, m1 = run_case("time", T=12.0, dt=0.0025)
+    t1, xi1, ve1, _, m1 = run_case("time", T=6.0, dt=0.03)
     plot_case(out_fig / "wavy-path.png", t1, xi1, ve1, "Case A: time-varying tangential speed")
 
-    t2, xi2, ve2, _, m2 = run_case("eta", T=12.0, dt=0.0025)
+    t2, xi2, ve2, _, m2 = run_case("eta", T=6.0, dt=0.03)
     plot_case(out_fig / "slowdown.png", t2, xi2, ve2, "Case B: eta-dependent tangential speed")
 
     mmc = monte_carlo(out_fig / "monte-carlo.png", trials=30)
