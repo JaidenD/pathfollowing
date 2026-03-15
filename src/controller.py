@@ -1,9 +1,8 @@
 from dataclasses import dataclass
-from typing import Optional
 import numpy as np
 
-from so3 import exp_so3
-from path import feedback_linearization, Path
+from so3 import exp_so3, log_so3
+from path import tube_coords, SO3Path
 
 
 @dataclass
@@ -33,76 +32,71 @@ class RefProfile:
         return -(np.pi / 12.0) * np.cos(np.pi * eta / 12.0)
 
 
-@dataclass
-class ControllerOptions:
-    regularize: bool = False
-    alpha_epsilon: float = 1e-8
-    eta_dot_limit: Optional[float] = None
-    torque_limit: Optional[float] = None
-    omega_limit: Optional[float] = None
+def compute_torque(
+    t: float,
+    R: np.ndarray,
+    w: np.ndarray,
+    path: SO3Path,
+    eta_prev: float,
+    gains: Gains,
+    J_nom: np.ndarray,
+    dt: float,
+    xi_prev: np.ndarray,
+):
+    eta_guess = eta_prev + dt * (w @ path.omega_at(eta_prev))
+    eta, xi, _ = tube_coords(path, R, eta_guess)
+
+    # Approximate ydot by projecting angular velocity onto tangent/normal frame
+    tvec = path.omega_at(eta)
+    n1, n2 = path.frame_at(eta)
+    ydot = np.array([tvec @ w, n1 @ w, n2 @ w])
+    xidot = ydot[1:]
+    etadot = ydot[0]
+
+    nu = 0.0
+    dnu_dt = 0.0
+    dnu_deta = 0.0
+    # filled by caller with profile object
+
+    v_perp = -(gains.Kp_xi @ xi + gains.Kd_xi @ xidot)
+
+    return eta, xi, ydot, v_perp
 
 
 def closed_loop_step(
     t: float,
     R: np.ndarray,
     w: np.ndarray,
-    path: Path,
+    path: SO3Path,
     eta_prev: float,
     gains: Gains,
     J_nom: np.ndarray,
     J_true: np.ndarray,
     ref: RefProfile,
     dt: float,
-    options: ControllerOptions,
+    xi_prev: np.ndarray,
 ):
-    data = feedback_linearization(
-        R=R,
-        omega=w,
-        eta_guess=eta_prev,
-        path=path,
-        Ib_inv=np.linalg.inv(J_nom),
-        regularize=options.regularize,
-        alpha_epsilon=options.alpha_epsilon,
-        eta_dot_limit=options.eta_dot_limit,
-        omega_limit=options.omega_limit,
-    )
-
-    eta = data["eta"]
-    xi = data["xi"]
-    eta_dot = data["eta_dot"]
-    xi_dot = data["xi_dot"]
-    A = data["A"]
-    f = data["f"]
-
-    v_perp = -(gains.Kp_xi @ xi + gains.Kd_xi @ xi_dot)
+    eta, xi, ydot, v_perp = compute_torque(t, R, w, path, eta_prev, gains, J_nom, dt, xi_prev)
+    etadot = ydot[0]
     nu = ref.nu(t, eta)
-    v_par = ref.dnu_dt(t, eta) + ref.dnu_deta(t, eta) * eta_dot - gains.kt * (eta_dot - nu)
-    v = np.hstack([v_perp, v_par])
+    v_par = ref.dnu_dt(t, eta) + ref.dnu_deta(t, eta) * etadot - gains.kt * (etadot - nu)
+    v = np.array([v_par, v_perp[0], v_perp[1]])
 
+    # Approximate mapping omega ~= [t n1 n2] ydot, thus yddot ~= [t n1 n2]^T wdot.
+    tvec = path.omega_at(eta)
+    n1, n2 = path.frame_at(eta)
+    B = np.stack([tvec, n1, n2], axis=1)
+
+    # D = M^{-1}J^{-1} with M approx B^T -> M^{-1} approx B
+    D = B.T @ np.linalg.inv(J_nom)
+    f = np.zeros(3)
     rhs = v - f
-    if np.linalg.cond(A) < 1e8:
-        tau = np.linalg.solve(A, rhs)
-    else:
-        tau = np.linalg.lstsq(A, rhs, rcond=None)[0]
-    if options.torque_limit is not None:
-        tau = np.clip(tau, -options.torque_limit, options.torque_limit)
+    tau = np.linalg.solve(D, rhs)
 
-    J_true_inv = np.linalg.inv(J_true)
+    # true rigid body dynamics
+    wdot = np.linalg.solve(J_true, tau - np.cross(w, J_true @ w))
+    w_mid = w + 0.5 * dt * wdot
+    Rn = R @ exp_so3(w_mid * dt)
+    wn = w + dt * wdot
 
-    def calc_wdot(wk: np.ndarray) -> np.ndarray:
-        wk_use = np.clip(wk, -options.omega_limit, options.omega_limit) if options.omega_limit is not None else wk
-        return J_true_inv @ (tau - np.cross(wk_use, J_true @ wk_use))
-
-    k1 = calc_wdot(w)
-    w2 = w + 0.5 * dt * k1
-    k2 = calc_wdot(w2)
-    w3 = w + 0.5 * dt * k2
-    k3 = calc_wdot(w3)
-    w4 = w + dt * k3
-    k4 = calc_wdot(w4)
-
-    wn = w + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
-    w_avg = (w + 2 * w2 + 2 * w3 + w4) / 6.0
-    Rn = R @ exp_so3(w_avg * dt)
-
-    return Rn, wn, eta, xi, eta_dot, nu, tau
+    return Rn, wn, eta, xi, etadot, nu, tau
